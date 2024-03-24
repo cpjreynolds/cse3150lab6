@@ -27,7 +27,26 @@ $(warning project is tested with GCC. your mileage may vary.)
 endif
 endif
 
-CXXFLAGS=-Wall -g --std=g++23 -march=native
+OPTOPTS=-ffast-math -Ofast -funroll-loops
+
+SIMDOPTS=-mavx
+
+ifdef NOAVX2
+	NOAVX512=1
+endif
+
+ifndef NOAVX2
+	SIMDOPTS+=-mavx2
+endif
+
+ifndef NOAVX512
+	SIMDOPTS+=-mavx512f
+endif
+
+CXXFLAGS=-Wall --std=gnu++23 ${OPTOPTS} ${SIMDOPTS}
+
+# to make the assembly more concise
+ASMEXTRA=-fverbose-asm
 
 # fix for libunwind issue on macos
 ifeq ($(uname_S),Darwin)
@@ -42,21 +61,27 @@ RUNTARGET=$(PROJECT).out
 # all source files including test
 SOURCES:=$(wildcard *.cpp)
 OBJECTS:=$(SOURCES:.cpp=.o)
+ASMFILES:=$(SOURCES:.cpp=.s)
 
 # only the regular main file
 #RSOURCES:=$(filter-out %.test.cpp,$(SOURCES))
 # only the testing main file
 #TSOURCES:=$(filter-out lab2.cpp,$(SOURCES))
 
-.PHONY: all clean check run leaks
+.PHONY: all clean check run leaks asm
 
-all: $(RUNTARGET) $(TESTTARGET)
+all: $(RUNTARGET)
 
 check: $(TESTTARGET)
 	./$(TESTTARGET)
 
 run: $(RUNTARGET)
 	./$(RUNTARGET)
+
+asm: clean $(ASMFILES)
+
+%.s: %.cpp
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(ASMEXTRA) -S $< -o $@
 
 $(TESTTARGET): $(SOURCES)
 	$(CXX) $(CPPFLAGS) -DTESTING $(CXXFLAGS) $^ -o $@
@@ -74,4 +99,5 @@ clean:
 		$(RUNTARGET)				\
 		$(RUNTARGET:.out=.out.dSYM)	\
 		$(TESTTARGET)				\
-		$(TESTTARGET:.out=.out.dSYM)
+		$(TESTTARGET:.out=.out.dSYM)\
+		$(ASMFILES)
