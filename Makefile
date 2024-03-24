@@ -45,10 +45,11 @@ endif
 
 CXXFLAGS=-Wall --std=gnu++23 ${OPTOPTS} ${SIMDOPTS}
 
-# to make the assembly more concise
+# to make the assembly more readable when I'm trying to verify the compiler
+# knows what it's doing
 ASMEXTRA=-fverbose-asm
 
-# fix for libunwind issue on macos
+# fix for libunwind issue on macos when compiling with GCC
 ifeq ($(uname_S),Darwin)
 CXXFLAGS += -Wl,-ld_classic
 endif
@@ -57,18 +58,22 @@ endif
 TESTTARGET=$(PROJECT)test.out
 # runnable target
 RUNTARGET=$(PROJECT).out
+# benchmark target
+BENCHTARGET=$(PROJECT)bench.out
+
+BENCHMAIN:=bench.cpp
+MAINMAIN:=$(PROJECT).cpp
 
 # all source files including test
 SOURCES:=$(wildcard *.cpp)
 OBJECTS:=$(SOURCES:.cpp=.o)
 ASMFILES:=$(SOURCES:.cpp=.s)
 
-# only the regular main file
-#RSOURCES:=$(filter-out %.test.cpp,$(SOURCES))
-# only the testing main file
-#TSOURCES:=$(filter-out lab2.cpp,$(SOURCES))
+SOURCES:=$(filter-out $(BENCHMAIN),$(SOURCES))
+BENCHSOURCES:=$(filter-out $(MAINMAIN),$(SOURCES))
 
-.PHONY: all clean check run leaks asm
+
+.PHONY: all clean check run leaks asm bench
 
 all: $(RUNTARGET)
 
@@ -78,6 +83,9 @@ check: $(TESTTARGET)
 run: $(RUNTARGET)
 	./$(RUNTARGET)
 
+bench: $(BENCHTARGET)
+	./$(BENCHTARGET)
+
 asm: clean $(ASMFILES)
 
 %.s: %.cpp
@@ -86,12 +94,17 @@ asm: clean $(ASMFILES)
 $(TESTTARGET): $(SOURCES)
 	$(CXX) $(CPPFLAGS) -DTESTING $(CXXFLAGS) $^ -o $@
 
-$(RUNTARGET): $(SOURCES)
+$(RUNTARGET): $(SOURCES) $(BENCHMAIN)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $^ -o $@
+
+$(BENCHTARGET): $(BENCHSOURCES)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $^ -o $@
+
 
 leaks: $(RUNTARGET) $(TESTTARGET)
 	leaks -atExit -quiet -- ./$(RUNTARGET)
 	leaks -atExit -quiet -- ./$(TESTTARGET)
+	leaks -atExit -quiet -- ./$(BENCHTARGET)
 
 clean:
 	rm -rf \
@@ -100,4 +113,6 @@ clean:
 		$(RUNTARGET:.out=.out.dSYM)	\
 		$(TESTTARGET)				\
 		$(TESTTARGET:.out=.out.dSYM)\
-		$(ASMFILES)
+		$(ASMFILES)					\
+		$(BENCHTARGET)				\
+		$(BENCHTARGET:.out=.out.dSYM)
