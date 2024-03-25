@@ -6,11 +6,13 @@
 #ifndef MATRIX_HPP
 #define MATRIX_HPP
 
+#include <iomanip>
 #include <iostream>
 #include <cstdlib>
 #include <cstddef>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <new>
 #include <initializer_list>
@@ -20,6 +22,7 @@
 #include <version>
 
 #include "cpuinfo.hpp"
+
 // summon the x86-64 gremlins.
 #include <immintrin.h>
 
@@ -55,7 +58,7 @@ static_assert(sizeof(m512) == alignof(m512));
 
 // types that can be used as vectors (vec-able)
 template<typename T>
-concept vecable = std::same_as<T, float> || std::same_as<T, m128>
+concept vecable = std::same_as<T, m128>
 #ifdef __AVX2__
                   || std::same_as<T, m256>
 #endif
@@ -63,6 +66,32 @@ concept vecable = std::same_as<T, float> || std::same_as<T, m128>
                   || std::same_as<T, m512>
 #endif
     ;
+
+// floating-point comparison
+//
+// https://floating-point-gui.de/errors/comparison/
+[[maybe_unused]] static constexpr bool cmpf(float a, float b)
+{
+    constexpr float eps = std::numeric_limits<float>::epsilon() * 100;
+    constexpr float min_norm = std::numeric_limits<float>::min();
+    constexpr float max_val = std::numeric_limits<float>::max();
+
+    float abs_a = std::fabs(a);
+    float abs_b = std::fabs(b);
+    float diff = std::fabs(a - b);
+
+    if (a == b) { // shortcut, handles infinities
+        return true;
+    }
+    else if (a == 0 || b == 0 || (abs_a + abs_b < min_norm)) {
+        // a or b is zero or both are extremely close to it
+        // relative error is less meaningful here
+        return diff < (eps * min_norm);
+    }
+    else { // use relative error
+        return diff / std::min((abs_a + abs_b), max_val) < eps;
+    }
+}
 
 template<typename T>
 struct vec_t_helper {
@@ -80,12 +109,12 @@ struct vec_t_helper<float> {
 //
 // https://en.cppreference.com/w/cpp/language/crtp
 template<typename T, typename V = m128>
-    requires vecable<V>
+    requires vecable<V> || std::same_as<V, float>
 class matrix {
 public:
     using vec_t = vec_t_helper<V>::type;
 
-    explicit matrix(size_t n, float init = 0.0)
+    explicit matrix(size_t n)
         : dim_{n}, data_{matrix::allocate((*this)->bytes()), &matrix::free}
     {
         // I actually needed this during testing. large alignment
@@ -95,10 +124,21 @@ public:
         if (data() == nullptr) {
             throw std::bad_alloc();
         }
-        std::memset(data(), init, (*this)->bytes());
+        std::memset(data(), 0, (*this)->bytes());
     };
 
+    matrix(size_t n, float init) : matrix{n}
+    {
+        for (auto i = 0u; i < n; ++i) {
+            std::fill_n((*this)[i], n, init);
+        }
+    }
+
+    // downcast for compile-time polymorphism.
+    //
+    // (*this)->xyz() NOT this->xyz() for overrides
     T* operator->() { return static_cast<T*>(this); }
+    const T* operator->() const { return static_cast<const T*>(this); }
 
     matrix(std::initializer_list<std::initializer_list<float>> init)
         : matrix(init.size())
@@ -108,7 +148,7 @@ public:
         }
         size_t i = 0;
         for (auto row : init) {
-            std::memcpy((*this)[i], row.begin(), dim());
+            std::memcpy((*this)[i], row.begin(), dim() * sizeof(float));
             ++i;
         }
     }
@@ -117,22 +157,22 @@ public:
         requires std::same_as<std::iter_value_t<I>, float>
     matrix(size_t n, I fst, I lst) : matrix(n)
     {
-        if (std::distance(fst, lst) != n * n) {
+        if (std::distance(fst, lst) != ptrdiff_t(n * n)) {
             throw std::logic_error("mismatched matrix dimensions");
         }
         for (auto i = 0u; i < n; ++i) {
             for (auto j = 0u; j < n; ++j) {
-                (*this)[i, j] = fst++;
+                (*this)[i, j] = *fst++;
             }
         }
     }
 
     // return a matrix filled with random floats
-    static matrix random(size_t n)
+    static matrix random(size_t n, float a = 0.0, float b = 1.0)
     {
         matrix mat(n);
         std::mt19937 gen(std::random_device{}());
-        std::uniform_real_distribution<float> dist(0.0, 1.0);
+        std::uniform_real_distribution<float> dist(a, b);
         for (size_t i = 0; i < n; ++i) {
             std::generate_n(mat[i], n, [&] { return dist(gen); });
         }
@@ -145,13 +185,36 @@ public:
     matrix(matrix&&) = default;
     matrix& operator=(matrix&&) = default;
 
-    float* operator[](size_t r) { return data() + (row_sizef() * r); }
+    friend bool operator==(const matrix& lhs, const matrix& rhs)
+    {
+        auto n = lhs.dim();
+        if (n != rhs.dim()) {
+            throw std::logic_error("mismatched matrix dimensions");
+        }
+        for (auto i = 0u; i < n; ++i) {
+            for (auto j = 0u; j < n; ++j) {
+                if (!cmpf(lhs[i, j], rhs[i, j])) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
 
+    friend bool operator!=(const matrix& lhs, const matrix& rhs)
+    {
+        return !(lhs == rhs);
+    }
+
+    // get a row
+    float* operator[](size_t r) { return data() + (row_sizef() * r); }
     const float* operator[](size_t r) const
     {
         return data() + (row_sizef() * r);
     }
 
+    // get an entry
+    //
     // woohoo c++23 multidimensional indexing
     float& operator[](size_t r, size_t c)
     {
@@ -163,18 +226,25 @@ public:
         return data()[(row_sizef() * r) + c];
     }
 
+    // be very careful with indices.
+    //
+    // The column index is always the same between vec_t/float indexing.
+    //
+    // The row in vec_t indexing is divided by vsize()
     vec_t& operator[](std::pair<size_t, size_t> idx)
     {
         // very legal and very cool
         vec_t* d = reinterpret_cast<vec_t*>(data());
-        return d[row_sizev() * idx.first + idx.second];
+        auto const rsv = (*this)->row_sizev();
+        return d[rsv * idx.first + idx.second];
     }
 
     const vec_t& operator[](std::pair<size_t, size_t> idx) const
     {
         // undefined behaviour? what undefined behaviour?
         const vec_t* d = reinterpret_cast<const vec_t*>(data());
-        return d[row_sizev() * idx.first + idx.second];
+        auto const rsv = (*this)->row_sizev();
+        return d[rsv * idx.first + idx.second];
     }
 
     // static polymorphism!
@@ -192,44 +262,58 @@ public:
         return reinterpret_cast<const vec_t*>(data());
     }
 
-    // square matrix dimension.
-    size_t dim() const { return dim_; }
-    // the logical size, not allocated size.
-    size_t size() const { return dim() * dim(); }
-    // the actual number of allocated bytes including padding. (default impl)
-    size_t bytes() const { return row_bytes() * dim(); }
-
     friend std::ostream& operator<<(std::ostream& os, const matrix& self)
     {
+        os << '\n';
         for (size_t i = 0; i < self.dim(); ++i) {
             for (size_t j = 0; j < self.dim(); ++j) {
-                os << self[i, j] << ' ';
+                os << std::setw(5) << std::fixed << std::setprecision(1)
+                   << self[i, j] << ' ';
             }
             os << '\n';
         }
+        os << std::setprecision(6);
         return os;
     }
+
+    // square matrix dimension.
+    size_t dim() const { return dim_; }
+    // the logical size in floats not allocated size.
+    size_t size() const { return dim() * dim(); }
+    // the actual number of allocated bytes including padding. (default impl)
+    size_t bytes() const { return row_bytes() * dim(); }
 
 protected:
     size_t dim_;
     std::unique_ptr<float, decltype(&std::free)> data_;
 
     // padded row size in vector units
+    //
+    // override for custom padding, all other size functions are implemented in
+    // terms of this one.
     constexpr size_t row_sizev() const
     {
         return (dim() + vsize() - 1) / vsize();
     }
 
     // padded row size in floats
-    constexpr size_t row_sizef() const { return row_sizev() * vsize(); }
+    constexpr size_t row_sizef() const
+    {
+        auto const rsv = (*this)->row_sizev();
+        return rsv * vsize();
+    }
 
     // padded row size in bytes
-    constexpr size_t row_bytes() const { return row_sizev() * sizeof(V); }
+    constexpr size_t row_bytes() const
+    {
+        auto const rsv = (*this)->row_sizev();
+        return rsv * sizeof(V);
+    }
 
-    // size of the backing vectors
+    // Number of floats in the backing vector.
     //
     // the constexpr branch suppresses the compiler warnings when V=float
-    static constexpr size_t vsize()
+    static consteval size_t vsize()
     {
         if constexpr (std::same_as<V, float>) {
             return 1;
@@ -265,36 +349,48 @@ private:
     }
 };
 
-template<typename V = m128, size_t H = 6, size_t W = 16>
-    requires(vecable<V> && !std::same_as<V, float>)
+template<typename V = m256, size_t H = 6, size_t W = 2>
+// for the moment this only works with m256
+    requires(vecable<V>)
 struct kernel_matrix : public matrix<kernel_matrix<V, H, W>, V> {
     using matrix_t = matrix<kernel_matrix<V, H, W>, V>;
-    // using matrix_t::matrix;
+    using typename matrix_t::matrix;
     using typename matrix_t::vec_t;
 
     matrix_t operator*(const matrix_t& rhs) const
     {
         matrix_t result(this->dim());
 
+        constexpr auto vsz = matrix_t::vsize();
         const auto n = this->dim();
-        const float* a = this->data();
-        const vec_t* b = rhs.vdata();
-        vec_t* c = result.vdata();
 
         const auto nx = this->pad_heightf();
         const auto ny = this->pad_widthf();
 
-        auto [l1, l2, l3] = cachesize();
-        const size_t s3 = std::min(l3 / nx / W * W, ny);
-        const size_t s2 = std::min(l2 / ny / H * H, nx);
-        const size_t s1 = std::min(l1 / s3, nx);
+        auto [L1, L2, L3] = cachesize();
+        // how many columns of b fit in L3
+        const size_t s3 = std::min(L3 / nx / (W * vsz) * (W * vsz), ny);
+        // how many rows of a fit in L2
+        const size_t s2 = std::min(L2 / ny / H * H, nx);
+        // how tall a (k x s3) block in b can be to fit in L1
+        const size_t s1 = std::min(L1 / s3, nx);
+
+        // tunable
+        // const size_t s3 = 64u;
+        // const size_t s2 = 120u;
+        // const size_t s1 = 240u;
+
+        const auto& a = *this;
+        const auto& b = rhs;
+        auto& c = result;
 
         for (auto i3 = 0u; i3 < ny; i3 += s3) {
             for (auto i2 = 0u; i2 < nx; i2 += s2) {
                 for (auto i1 = 0u; i1 < ny; i1 += s1) {
 
                     for (auto x = i2; x < std::min(i2 + s2, nx); x += H) {
-                        for (auto y = i3; y < std::min(i3 + s3, ny); y += W) {
+                        for (auto y = i3; y < std::min(i3 + s3, ny);
+                             y += W * vsz) {
                             kernel(a, b, c, x, y, i1, std::min(i1 + s1, n), ny);
                         }
                     }
@@ -304,82 +400,340 @@ struct kernel_matrix : public matrix<kernel_matrix<V, H, W>, V> {
         return result;
     }
 
-    static void kernel(const float* a, const vec_t* b, vec_t* __restrict__ c,
+    // where h = H and w = W*vsize
+    //
+    // updates the h*w submatrix C[x:x+h][y:y+w]
+    //      using A[x:x+h][l:r] and B[l:r][y:y+w]
+    //
+    // taking columns of l:r from A and rows l:r from B
+    static void kernel(const matrix_t& a, const matrix_t& b, matrix_t& c,
                        size_t x, size_t y, size_t l, size_t r, size_t n)
     {
-        constexpr size_t hv = H;
-        constexpr size_t wv = W / matrix_t::vsize();
-        constexpr size_t vsz = matrix_t::vsize();
-        static_assert(W % matrix_t::vsize() == 0, "bad kernel width");
-        // vec_t t[hv][wv] = {set0()};
+        // 16(actually 32) registers total in the hardware.
+        //
+        //  H*W for the kernel accumulator (t)
+        //  + W to load b[k,y+j] (W times)
+        //  + 1 for the alpha accumulator.
+        constexpr auto vsz = matrix_t::vsize();
+        // GCC allocates stack space for these even though its unecessary.
+        //
+        // The specializations for specific kernel sizes are sliiiightly faster
+        // and definitely faster for AVX512 where they can use all 32 regs
+        vec_t t[H][W]{0};
 
-        if constexpr (std::same_as<m256, V>) {
-            register vec_t t0 asm("ymm0") = set0();
-            register vec_t t1 asm("ymm1") = set0();
-            register vec_t t2 asm("ymm2") = set0();
-            register vec_t t3 asm("ymm3") = set0();
-            register vec_t t4 asm("ymm4") = set0();
-            register vec_t t5 asm("ymm5") = set0();
-            register vec_t t6 asm("ymm6") = set0();
-            register vec_t t7 asm("ymm7") = set0();
-            register vec_t t8 asm("ymm8") = set0();
-            register vec_t t9 asm("ymm9") = set0();
-            register vec_t t10 asm("ymm10") = set0();
-            register vec_t t11 asm("ymm11") = set0();
-            vec_t t[6][2] = {{t0, t1}, {t2, t3}, {t4, t5},
-                             {t6, t7}, {t8, t9}, {t10, t11}};
-            for (auto k = l; k < r; ++k) {
-                for (auto i = 0u; i < hv; ++i) {
-                    vec_t alpha = set1(a[(x + i) * n + k]);
-                    for (auto j = 0u; j < wv; ++j) {
-                        t[i][j] += alpha * b[(k * n + y) / vsz + j];
-                    }
-                }
-            }
-            for (auto i = 0u; i < hv; ++i) {
-                for (auto j = 0u; j < wv; ++j) {
-                    c[((x + i) * n + y) / vsz + j] += t[i][j];
+        // for each column
+        for (auto k = l; k < r; ++k) {
+            // for each row
+            __builtin_prefetch(&b[{k + 1, (y / vsz)}]);
+            for (auto i = 0u; i < H; ++i) {
+                // load a single float from A and broadcast it into a vector
+                vec_t alpha = vec_t{} + a[(x + i), k];
+
+                // The loads of B *should* be hoisted into the outermost loop
+                // as they don't depend on i and j is known at compile-time.
+                // This uses W registers.
+                //
+                // emphasis on should.
+                //
+                // now, for each vector of columns in B
+                //  (i.e. `vsize` floats from the current row, at a time)
+                for (auto j = 0u; j < W; ++j) {
+                    // multiply vsize columns in row k from B
+                    // with vsize copies of the value in A[x+i,k]
+                    t[i][j] += alpha * b[{k, (y / vsz) + j}];
                 }
             }
         }
-        else if constexpr (std::same_as<m512, V>) {
-            register vec_t t0 asm("zmm0") = set0();
-            register vec_t t1 asm("zmm1") = set0();
-            register vec_t t2 asm("zmm2") = set0();
-            register vec_t t3 asm("zmm3") = set0();
-            register vec_t t4 asm("zmm4") = set0();
-            register vec_t t5 asm("zmm5") = set0();
-            vec_t t[6][1] = {{t0}, {t1}, {t2}, {t3}, {t4}, {t5}};
-            for (auto k = l; k < r; ++k) {
-                for (auto i = 0u; i < hv; ++i) {
-                    vec_t alpha = set1(a[(x + i) * n + k]);
-                    for (auto j = 0u; j < wv; ++j) {
-                        t[i][j] += alpha * b[(k * n + y) / vsz + j];
-                    }
-                }
-            }
-            for (auto i = 0u; i < hv; ++i) {
-                for (auto j = 0u; j < wv; ++j) {
-                    c[((x + i) * n + y) / vsz + j] += t[i][j];
-                }
+        // for each vector in the kernel, update the result matrix accordingly
+        for (auto i = 0u; i < H; ++i) {
+            for (auto j = 0u; j < W; ++j) {
+                c[{x + i, (y / vsz) + j}] += t[i][j];
             }
         }
-        else {
-            vec_t t[hv][wv] = {set0()};
-            for (auto k = l; k < r; ++k) {
-                for (auto i = 0u; i < hv; ++i) {
-                    vec_t alpha = set1(a[(x + i) * n + k]);
-                    for (auto j = 0u; j < wv; ++j) {
-                        t[i][j] += alpha * b[(k * n + y) / vsz + j];
-                    }
-                }
-            }
-            for (auto i = 0u; i < hv; ++i) {
-                for (auto j = 0u; j < wv; ++j) {
-                    c[((x + i) * n + y) / vsz + j] += t[i][j];
-                }
-            }
+    }
+
+    // specialized 8x2 kernel
+    static void kernel(const matrix_t& a, const matrix_t& b, matrix_t& c,
+                       size_t x, size_t y, size_t l, size_t r, size_t n)
+        requires(std::same_as<V, m512> && H == 8 && W == 2)
+    {
+        constexpr auto vsz = matrix_t::vsize();
+
+        register vec_t t00 asm("zmm0") = _mm512_setzero_ps();
+        register vec_t t01 asm("zmm1") = _mm512_setzero_ps();
+        register vec_t t10 asm("zmm2") = _mm512_setzero_ps();
+        register vec_t t11 asm("zmm3") = _mm512_setzero_ps();
+        register vec_t t20 asm("zmm4") = _mm512_setzero_ps();
+        register vec_t t21 asm("zmm5") = _mm512_setzero_ps();
+        register vec_t t30 asm("zmm6") = _mm512_setzero_ps();
+        register vec_t t31 asm("zmm7") = _mm512_setzero_ps();
+
+        register vec_t t40 asm("zmm8") = _mm512_setzero_ps();
+        register vec_t t41 asm("zmm9") = _mm512_setzero_ps();
+        register vec_t t50 asm("zmm10") = _mm512_setzero_ps();
+        register vec_t t51 asm("zmm11") = _mm512_setzero_ps();
+        register vec_t t60 asm("zmm12") = _mm512_setzero_ps();
+        register vec_t t61 asm("zmm13") = _mm512_setzero_ps();
+        register vec_t t70 asm("zmm14") = _mm512_setzero_ps();
+        register vec_t t71 asm("zmm15") = _mm512_setzero_ps();
+
+        for (auto k = l; k < r; ++k) {
+            __builtin_prefetch(&b[{k + 1, (y / vsz)}]);
+            __builtin_prefetch(&b[{k + 1, (y / vsz) + 1}]);
+            register vec_t b0 asm("zmm16") = b[{k, (y / vsz) + 0}];
+            register vec_t b1 asm("zmm17") = b[{k, (y / vsz) + 1}];
+            vec_t a0 = vec_t{} + a[(x + 0), k];
+            t00 += a0 * b0;
+            t01 += a0 * b1;
+            vec_t a1 = vec_t{} + a[(x + 1), k];
+            t10 += a1 * b0;
+            t11 += a1 * b1;
+            vec_t a2 = vec_t{} + a[(x + 2), k];
+            t20 += a2 * b0;
+            t21 += a2 * b1;
+            vec_t a3 = vec_t{} + a[(x + 3), k];
+            t30 += a3 * b0;
+            t31 += a3 * b1;
+            vec_t a4 = vec_t{} + a[(x + 4), k];
+            t40 += a4 * b0;
+            t41 += a4 * b1;
+            vec_t a5 = vec_t{} + a[(x + 5), k];
+            t50 += a5 * b0;
+            t51 += a5 * b1;
+            vec_t a6 = vec_t{} + a[(x + 6), k];
+            t60 += a6 * b0;
+            t61 += a6 * b1;
+            vec_t a7 = vec_t{} + a[(x + 7), k];
+            t70 += a7 * b0;
+            t71 += a7 * b1;
         }
+        c[{x + 0, (y / vsz) + 0}] += t00;
+        c[{x + 0, (y / vsz) + 1}] += t01;
+        c[{x + 1, (y / vsz) + 0}] += t10;
+        c[{x + 1, (y / vsz) + 1}] += t11;
+        c[{x + 2, (y / vsz) + 0}] += t20;
+        c[{x + 2, (y / vsz) + 1}] += t21;
+        c[{x + 3, (y / vsz) + 0}] += t30;
+        c[{x + 3, (y / vsz) + 1}] += t31;
+        c[{x + 4, (y / vsz) + 0}] += t40;
+        c[{x + 4, (y / vsz) + 1}] += t41;
+        c[{x + 5, (y / vsz) + 0}] += t50;
+        c[{x + 5, (y / vsz) + 1}] += t51;
+        c[{x + 6, (y / vsz) + 0}] += t60;
+        c[{x + 6, (y / vsz) + 1}] += t61;
+        c[{x + 7, (y / vsz) + 0}] += t70;
+        c[{x + 7, (y / vsz) + 1}] += t71;
+    }
+
+    // 12x2 kernel
+    static void kernel(const matrix_t& a, const matrix_t& b, matrix_t& c,
+                       size_t x, size_t y, size_t l, size_t r, size_t n)
+        requires(std::same_as<V, m512> && H == 12 && W == 2)
+    {
+        constexpr auto vsz = matrix_t::vsize();
+
+        register vec_t t00 asm("zmm0") = _mm512_setzero_ps();
+        register vec_t t01 asm("zmm1") = _mm512_setzero_ps();
+        register vec_t t10 asm("zmm2") = _mm512_setzero_ps();
+        register vec_t t11 asm("zmm3") = _mm512_setzero_ps();
+        register vec_t t20 asm("zmm4") = _mm512_setzero_ps();
+        register vec_t t21 asm("zmm5") = _mm512_setzero_ps();
+        register vec_t t30 asm("zmm6") = _mm512_setzero_ps();
+        register vec_t t31 asm("zmm7") = _mm512_setzero_ps();
+
+        register vec_t t40 asm("zmm8") = _mm512_setzero_ps();
+        register vec_t t41 asm("zmm9") = _mm512_setzero_ps();
+        register vec_t t50 asm("zmm10") = _mm512_setzero_ps();
+        register vec_t t51 asm("zmm11") = _mm512_setzero_ps();
+        register vec_t t60 asm("zmm12") = _mm512_setzero_ps();
+        register vec_t t61 asm("zmm13") = _mm512_setzero_ps();
+        register vec_t t70 asm("zmm14") = _mm512_setzero_ps();
+        register vec_t t71 asm("zmm15") = _mm512_setzero_ps();
+
+        register vec_t t80 asm("zmm16") = _mm512_setzero_ps();
+        register vec_t t81 asm("zmm17") = _mm512_setzero_ps();
+        register vec_t t90 asm("zmm18") = _mm512_setzero_ps();
+        register vec_t t91 asm("zmm19") = _mm512_setzero_ps();
+        register vec_t t10_0 asm("zmm20") = _mm512_setzero_ps();
+        register vec_t t10_1 asm("zmm21") = _mm512_setzero_ps();
+        register vec_t t11_0 asm("zmm22") = _mm512_setzero_ps();
+        register vec_t t11_1 asm("zmm23") = _mm512_setzero_ps();
+
+        for (auto k = l; k < r; ++k) {
+            __builtin_prefetch(&b[{k + 1, (y / vsz)}]);
+            __builtin_prefetch(&b[{k + 1, (y / vsz) + 1}]);
+            register vec_t b0 asm("zmm24") = b[{k, (y / vsz) + 0}];
+            register vec_t b1 asm("zmm25") = b[{k, (y / vsz) + 1}];
+
+            vec_t a0 = vec_t{} + a[(x + 0), k];
+            t00 += a0 * b0;
+            t01 += a0 * b1;
+            vec_t a1 = vec_t{} + a[(x + 1), k];
+            t10 += a1 * b0;
+            t11 += a1 * b1;
+            vec_t a2 = vec_t{} + a[(x + 2), k];
+            t20 += a2 * b0;
+            t21 += a2 * b1;
+            vec_t a3 = vec_t{} + a[(x + 3), k];
+            t30 += a3 * b0;
+            t31 += a3 * b1;
+            vec_t a4 = vec_t{} + a[(x + 4), k];
+            t40 += a4 * b0;
+            t41 += a4 * b1;
+            vec_t a5 = vec_t{} + a[(x + 5), k];
+            t50 += a5 * b0;
+            t51 += a5 * b1;
+            vec_t a6 = vec_t{} + a[(x + 6), k];
+            t60 += a6 * b0;
+            t61 += a6 * b1;
+            vec_t a7 = vec_t{} + a[(x + 7), k];
+            t70 += a7 * b0;
+            t71 += a7 * b1;
+            vec_t a8 = vec_t{} + a[(x + 8), k];
+            t80 += a8 * b0;
+            t81 += a8 * b1;
+            vec_t a9 = vec_t{} + a[(x + 9), k];
+            t90 += a9 * b0;
+            t91 += a9 * b1;
+            vec_t a10 = vec_t{} + a[(x + 10), k];
+            t10_0 += a10 * b0;
+            t10_1 += a10 * b1;
+            vec_t a11 = vec_t{} + a[(x + 11), k];
+            t11_0 += a11 * b0;
+            t11_1 += a11 * b1;
+        }
+        c[{x + 0, (y / vsz) + 0}] += t00;
+        c[{x + 0, (y / vsz) + 1}] += t01;
+        c[{x + 1, (y / vsz) + 0}] += t10;
+        c[{x + 1, (y / vsz) + 1}] += t11;
+        c[{x + 2, (y / vsz) + 0}] += t20;
+        c[{x + 2, (y / vsz) + 1}] += t21;
+        c[{x + 3, (y / vsz) + 0}] += t30;
+        c[{x + 3, (y / vsz) + 1}] += t31;
+        c[{x + 4, (y / vsz) + 0}] += t40;
+        c[{x + 4, (y / vsz) + 1}] += t41;
+        c[{x + 5, (y / vsz) + 0}] += t50;
+        c[{x + 5, (y / vsz) + 1}] += t51;
+        c[{x + 6, (y / vsz) + 0}] += t60;
+        c[{x + 6, (y / vsz) + 1}] += t61;
+        c[{x + 7, (y / vsz) + 0}] += t70;
+        c[{x + 7, (y / vsz) + 1}] += t71;
+        c[{x + 8, (y / vsz) + 0}] += t80;
+        c[{x + 8, (y / vsz) + 1}] += t81;
+        c[{x + 9, (y / vsz) + 0}] += t90;
+        c[{x + 9, (y / vsz) + 1}] += t91;
+        c[{x + 10, (y / vsz) + 0}] += t10_0;
+        c[{x + 10, (y / vsz) + 1}] += t10_1;
+        c[{x + 11, (y / vsz) + 0}] += t11_0;
+        c[{x + 11, (y / vsz) + 1}] += t11_1;
+    }
+
+    static void kernel(const matrix_t& a, const matrix_t& b, matrix_t& c,
+                       size_t x, size_t y, size_t l, size_t r, size_t n)
+        requires(std::same_as<V, m512> && H == 6 && W == 4)
+    {
+        constexpr auto vsz = matrix_t::vsize();
+
+        register vec_t t00 asm("zmm0") = _mm512_setzero_ps();
+        register vec_t t01 asm("zmm1") = _mm512_setzero_ps();
+        register vec_t t02 asm("zmm2") = _mm512_setzero_ps();
+        register vec_t t03 asm("zmm3") = _mm512_setzero_ps();
+
+        register vec_t t10 asm("zmm4") = _mm512_setzero_ps();
+        register vec_t t11 asm("zmm5") = _mm512_setzero_ps();
+        register vec_t t12 asm("zmm6") = _mm512_setzero_ps();
+        register vec_t t13 asm("zmm7") = _mm512_setzero_ps();
+
+        register vec_t t20 asm("zmm8") = _mm512_setzero_ps();
+        register vec_t t21 asm("zmm9") = _mm512_setzero_ps();
+        register vec_t t22 asm("zmm10") = _mm512_setzero_ps();
+        register vec_t t23 asm("zmm11") = _mm512_setzero_ps();
+
+        register vec_t t30 asm("zmm12") = _mm512_setzero_ps();
+        register vec_t t31 asm("zmm13") = _mm512_setzero_ps();
+        register vec_t t32 asm("zmm14") = _mm512_setzero_ps();
+        register vec_t t33 asm("zmm15") = _mm512_setzero_ps();
+
+        register vec_t t40 asm("zmm16") = _mm512_setzero_ps();
+        register vec_t t41 asm("zmm17") = _mm512_setzero_ps();
+        register vec_t t42 asm("zmm18") = _mm512_setzero_ps();
+        register vec_t t43 asm("zmm19") = _mm512_setzero_ps();
+
+        register vec_t t50 asm("zmm20") = _mm512_setzero_ps();
+        register vec_t t51 asm("zmm21") = _mm512_setzero_ps();
+        register vec_t t52 asm("zmm22") = _mm512_setzero_ps();
+        register vec_t t53 asm("zmm23") = _mm512_setzero_ps();
+
+        for (auto k = l; k < r; ++k) {
+            __builtin_prefetch(&b[{k + 1, (y / vsz)}]);
+            __builtin_prefetch(&b[{k + 1, (y / vsz) + 1}]);
+            __builtin_prefetch(&b[{k + 1, (y / vsz) + 2}]);
+            __builtin_prefetch(&b[{k + 1, (y / vsz) + 3}]);
+            register vec_t b0 asm("zmm24") = b[{k, (y / vsz) + 0}];
+            register vec_t b1 asm("zmm25") = b[{k, (y / vsz) + 1}];
+            register vec_t b2 asm("zmm26") = b[{k, (y / vsz) + 2}];
+            register vec_t b3 asm("zmm27") = b[{k, (y / vsz) + 3}];
+
+            vec_t a0 = vec_t{} + a[(x + 0), k];
+            t00 += a0 * b0;
+            t01 += a0 * b1;
+            t02 += a0 * b2;
+            t03 += a0 * b3;
+            vec_t a1 = vec_t{} + a[(x + 1), k];
+            t10 += a1 * b0;
+            t11 += a1 * b1;
+            t12 += a1 * b2;
+            t13 += a1 * b3;
+            vec_t a2 = vec_t{} + a[(x + 2), k];
+            t20 += a2 * b0;
+            t21 += a2 * b1;
+            t22 += a2 * b2;
+            t23 += a2 * b3;
+            vec_t a3 = vec_t{} + a[(x + 3), k];
+            t30 += a3 * b0;
+            t31 += a3 * b1;
+            t32 += a3 * b2;
+            t33 += a3 * b3;
+            vec_t a4 = vec_t{} + a[(x + 4), k];
+            t40 += a4 * b0;
+            t41 += a4 * b1;
+            t42 += a4 * b2;
+            t43 += a4 * b3;
+            vec_t a5 = vec_t{} + a[(x + 5), k];
+            t50 += a5 * b0;
+            t51 += a5 * b1;
+            t52 += a5 * b2;
+            t53 += a5 * b3;
+        }
+        c[{x + 0, (y / vsz) + 0}] += t00;
+        c[{x + 0, (y / vsz) + 1}] += t01;
+        c[{x + 0, (y / vsz) + 2}] += t02;
+        c[{x + 0, (y / vsz) + 3}] += t03;
+
+        c[{x + 1, (y / vsz) + 0}] += t10;
+        c[{x + 1, (y / vsz) + 1}] += t11;
+        c[{x + 1, (y / vsz) + 2}] += t12;
+        c[{x + 1, (y / vsz) + 3}] += t13;
+
+        c[{x + 2, (y / vsz) + 0}] += t20;
+        c[{x + 2, (y / vsz) + 1}] += t21;
+        c[{x + 2, (y / vsz) + 2}] += t22;
+        c[{x + 2, (y / vsz) + 3}] += t23;
+
+        c[{x + 3, (y / vsz) + 0}] += t30;
+        c[{x + 3, (y / vsz) + 1}] += t31;
+        c[{x + 3, (y / vsz) + 2}] += t32;
+        c[{x + 3, (y / vsz) + 3}] += t33;
+
+        c[{x + 4, (y / vsz) + 0}] += t40;
+        c[{x + 4, (y / vsz) + 1}] += t41;
+        c[{x + 4, (y / vsz) + 2}] += t42;
+        c[{x + 4, (y / vsz) + 3}] += t43;
+
+        c[{x + 5, (y / vsz) + 0}] += t50;
+        c[{x + 5, (y / vsz) + 1}] += t51;
+        c[{x + 5, (y / vsz) + 2}] += t52;
+        c[{x + 5, (y / vsz) + 3}] += t53;
     }
 
     static constexpr vec_t set1(float a)
@@ -415,18 +769,29 @@ struct kernel_matrix : public matrix<kernel_matrix<V, H, W>, V> {
     }
     constexpr size_t pad_widthf() const
     {
-        return ((this->dim() + W - 1) / W) * W;
+        // kernel width in floats
+        constexpr auto kwf = W * matrix_t::vsize();
+        // rounded up to the nearest multiple
+        return ((this->dim() + kwf - 1) / kwf) * kwf;
     }
 
-    // overrides because of different padding requirements
-    size_t bytes() const
+    // padded row size in vector units
+    constexpr size_t row_sizev() const // override
     {
-        return this->row_sizef() * pad_heightf() * this->vsize();
+        return pad_widthf() / matrix_t::vsize();
+    }
+
+    // total allocated bytes including padding
+    // (overrides because both height and width are padded)
+    constexpr size_t bytes() const // override
+    {
+        return this->row_sizef() * pad_heightf() * sizeof(float);
     }
 };
 
 // implements basic SIMD matrix multiplication
 template<typename V = m128>
+    requires(vecable<V>)
 class simd_matrix : public matrix<simd_matrix<V>, V> {
 public:
     using matrix_t = matrix<simd_matrix<V>, V>;
@@ -445,23 +810,15 @@ public:
 
         // transpose rhs matrix for better cache locality
         auto trbm = matrix_t(n);
-        auto _b = rhs.data();
-        vec_t* b = reinterpret_cast<vec_t*>(trbm.data());
         for (size_t i = 0; i < n; ++i) {
             for (size_t j = 0; j < n; ++j) {
-                b[i * rowsz + j / vecsz][j % vecsz] = _b[j * n + i];
-                // trbm[i, j] = rhs[j, i];
+                trbm[i, j] = rhs[j, i];
             }
         }
 
-        const vec_t* a = reinterpret_cast<const vec_t*>(this->data());
-        float* c = result.data();
-
-        /*
         const auto& a = *this;
         const auto& b = trbm;
         auto& c = result;
-        */
 
         // c[i,j] = sum(k=0 -> n){ a[i,k] * b[k,j] }
         //
@@ -473,16 +830,13 @@ public:
 
                 // vertical sum
                 for (size_t k = 0; k < rowsz; ++k)
-                    acc += a[i * rowsz + k] * b[j * rowsz + k];
-                // acc += a[{i, k}] * b[{j, k}];
+                    acc += a[{i, k}] * b[{j, k}];
 
                 // horizontal sum
                 for (size_t k = 0; k < vecsz; ++k)
-                    c[i * n + j] += acc[k];
-                // c[i, j] += acc[k];
+                    c[i, j] += acc[k];
             }
         }
-
         return result;
     }
 };

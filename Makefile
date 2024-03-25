@@ -69,8 +69,8 @@ SOURCES:=$(wildcard *.cpp)
 OBJECTS:=$(SOURCES:.cpp=.o)
 ASMFILES:=$(SOURCES:.cpp=.s)
 
-SOURCES:=$(filter-out $(BENCHMAIN),$(SOURCES))
 BENCHSOURCES:=$(filter-out $(MAINMAIN),$(SOURCES))
+SOURCES:=$(filter-out $(BENCHMAIN),$(SOURCES))
 
 
 .PHONY: all clean check run leaks asm bench
@@ -94,7 +94,7 @@ asm: clean $(ASMFILES)
 $(TESTTARGET): $(SOURCES)
 	$(CXX) $(CPPFLAGS) -DTESTING $(CXXFLAGS) $^ -o $@
 
-$(RUNTARGET): $(SOURCES) $(BENCHMAIN)
+$(RUNTARGET): $(SOURCES)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $^ -o $@
 
 $(BENCHTARGET): $(BENCHSOURCES)
