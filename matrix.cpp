@@ -2,6 +2,8 @@
 #include "doctest.h"
 #include <vector>
 
+#include <sstream>
+
 #include "mtestvals.hpp"
 #include "matrix.hpp"
 
@@ -11,6 +13,17 @@
 // construction.
 TEST_SUITE("matrix")
 {
+    TEST_CASE("operator>>")
+    {
+        std::istringstream input("1 2 3\n4 5 6\n7 8 9");
+        basic_matrix tmat{{1., 2., 3.}, {4., 5., 6.}, {7., 8., 9.}};
+
+        basic_matrix m;
+        input >> m;
+
+        CHECK(m == tmat);
+    }
+
     TEST_CASE("equality")
     {
         // need to initialize two identical matrices in two different ways to

@@ -20,6 +20,7 @@
 #include <utility>
 #include <algorithm>
 #include <version>
+#include <sstream>
 
 #include "cpuinfo.hpp"
 
@@ -70,9 +71,9 @@ concept vecable = std::same_as<T, m128>
 // floating-point comparison
 //
 // https://floating-point-gui.de/errors/comparison/
-[[maybe_unused]] static constexpr bool cmpf(float a, float b)
+[[maybe_unused]] constexpr bool
+cmpf(float a, float b, float eps = std::numeric_limits<float>::epsilon() * 100)
 {
-    constexpr float eps = std::numeric_limits<float>::epsilon() * 100;
     constexpr float min_norm = std::numeric_limits<float>::min();
     constexpr float max_val = std::numeric_limits<float>::max();
 
@@ -114,6 +115,8 @@ class matrix {
 public:
     using vec_t = vec_t_helper<V>::type;
 
+    matrix() : dim_{0}, data_{nullptr, &matrix::free} {}
+
     explicit matrix(size_t n)
         : dim_{n}, data_{matrix::allocate((*this)->bytes()), &matrix::free}
     {
@@ -149,6 +152,18 @@ public:
         size_t i = 0;
         for (auto row : init) {
             std::memcpy((*this)[i], row.begin(), dim() * sizeof(float));
+            ++i;
+        }
+    }
+
+    matrix(std::vector<std::vector<float>>& init) : matrix{init.size()}
+    {
+        if (init.size() != init.begin()->size()) {
+            throw std::logic_error("mismatched matrix dimensions");
+        }
+        size_t i = 0;
+        for (auto row : init) {
+            std::memcpy((*this)[i], row.data(), dim() * sizeof(float));
             ++i;
         }
     }
@@ -276,6 +291,26 @@ public:
         return os;
     }
 
+    friend std::istream& operator>>(std::istream& is, matrix& self)
+    {
+        std::vector<std::vector<float>> vals;
+
+        for (std::string line; std::getline(is, line);) {
+            std::istringstream iss{std::move(line)};
+            std::vector<float> linevals;
+            for (float i; iss >> i;) {
+                linevals.push_back(i);
+            }
+            vals.push_back(std::move(linevals));
+        }
+
+        auto mat = matrix(vals);
+
+        std::swap(self, mat);
+
+        return is;
+    }
+
     // square matrix dimension.
     size_t dim() const { return dim_; }
     // the logical size in floats not allocated size.
@@ -350,11 +385,10 @@ private:
 };
 
 template<typename V = m256, size_t H = 6, size_t W = 2>
-// for the moment this only works with m256
     requires(vecable<V>)
 struct kernel_matrix : public matrix<kernel_matrix<V, H, W>, V> {
     using matrix_t = matrix<kernel_matrix<V, H, W>, V>;
-    using typename matrix_t::matrix;
+    using matrix<kernel_matrix<V, H, W>, V>::matrix;
     using typename matrix_t::vec_t;
 
     matrix_t operator*(const matrix_t& rhs) const
@@ -795,7 +829,7 @@ template<typename V = m128>
 class simd_matrix : public matrix<simd_matrix<V>, V> {
 public:
     using matrix_t = matrix<simd_matrix<V>, V>;
-    using matrix_t::matrix;
+    using matrix<simd_matrix<V>, V>::matrix;
     using typename matrix_t::vec_t;
 
     matrix_t operator*(const matrix_t& rhs) const
@@ -873,5 +907,13 @@ public:
         return result;
     }
 };
+
+#if defined(__AVX512F__)
+using basic_matrix = kernel_matrix<m256, 8, 2>;
+#elif defined(__AVX2__)
+using basic_matrix = kernel_matrix<m256, 8, 2>;
+#else
+using basic_matrix = kernel_matrix<m128, 8, 2>;
+#endif
 
 #endif
