@@ -1,5 +1,4 @@
 #include "matrix.hpp"
-#ifndef TESTING
 
 #include <fstream>
 #include <iostream>
@@ -50,6 +49,8 @@ static basic_matrix exact0paths(basic_matrix& a, basic_matrix& b,
     return result;
 }
 
+#ifndef TESTING
+
 // does the thing the assignment page requires
 static basic_matrix do_3file_input(const char* argv[])
 {
@@ -93,4 +94,15 @@ int main(int argc, const char* argv[])
 #else
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
+
+TEST_CASE("exact0paths")
+{
+    basic_matrix allones(4, 1.0);
+
+    basic_matrix tm1{{-1, 2, 2, 2}, {2, 2, 2, 2}, {2, 2, 2, 2}, {2, 2, 2, 2}};
+    basic_matrix t0{{2, 2, 2, 2}, {2, 2, 2, 2}, {2, 2, 2, 2}, {2, 2, 2, 2}};
+    basic_matrix t1{{2, 1, 2, 2}, {2, 2, 1, 2}, {2, 2, 2, 1}, {1, 2, 2, 2}};
+
+    CHECK(exact0paths(tm1, t0, t1) == allones);
+}
 #endif

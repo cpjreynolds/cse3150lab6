@@ -6,7 +6,11 @@
 
 `make check` to compile and run tests.
 
-`make run` to compile and execute `./lab6.out`
+`make run` to compile and execute `./lab6.out` with default filenames.
+
+### Usage
+
+`./lab6.out <file1> <file2> <file3>` to use input files other than the default.
 
 ### Note
 
